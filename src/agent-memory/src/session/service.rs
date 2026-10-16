@@ -255,7 +255,7 @@ impl SessionLogService {
         let _g = self.log_file.lock().unwrap_or_else(|e| e.into_inner());
         let raw = std::fs::read(&self.log_path)?;
         if raw.len() <= Self::MAX_SESSION_LOG_BYTES as usize {
-            return String::from_utf8(raw).map_err(|e| MemoryError::Other(e.to_string()));
+            return Ok(Self::decode_log(&raw));
         }
         // Return the tail: find a line boundary near the end of the cap.
         let cap = Self::MAX_SESSION_LOG_BYTES as usize;
@@ -264,7 +264,34 @@ impl SessionLogService {
             .position(|&b| b == b'\n')
             .map(|p| raw.len() - cap + p + 1)
             .unwrap_or(raw.len() - cap);
-        String::from_utf8(raw[start..].to_vec()).map_err(|e| MemoryError::Other(e.to_string()))
+        Ok(Self::decode_log(&raw[start..]))
+    }
+
+    /// Decode a log snapshot, dropping a torn final line.
+    ///
+    /// A crash (or SIGKILL) mid-append can leave the last line partially
+    /// written — possibly cut inside a multi-byte character, which is an
+    /// ordinary shape here because session logs carry CJK text. Decoding the
+    /// whole window with `String::from_utf8` failed on those bytes, so the
+    /// complete lines before the tear were lost with them and `mem_session_log`
+    /// stayed broken for the rest of the post-mortem. The tail-truncation path
+    /// above exists to survive a dirty log; this is the same rule for the dirty
+    /// end of it. A partial line is not something a caller can parse, so it is
+    /// dropped whole — and when the buffer holds no complete line at all, the
+    /// answer is empty rather than an error.
+    fn decode_log(raw: &[u8]) -> String {
+        match std::str::from_utf8(raw) {
+            Ok(text) => text.to_string(),
+            Err(error) => {
+                let prefix = &raw[..error.valid_up_to()];
+                let complete = prefix
+                    .iter()
+                    .rposition(|&byte| byte == b'\n')
+                    .map(|position| position + 1)
+                    .unwrap_or(0);
+                String::from_utf8_lossy(&raw[..complete]).into_owned()
+            }
+        }
     }
 
     /// Copy a file from `<scratch>/<src_in_scratch>` to `<mount.root>/<dst_in_store>`.

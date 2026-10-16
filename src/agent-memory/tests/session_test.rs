@@ -396,3 +396,93 @@ fn audit_log_is_mirrored_to_session() {
     assert!(store_audit.contains("\"tool\":\"mem_write\""));
     assert!(session_log.contains("\"tool\":\"mem_write\""));
 }
+
+// ---------- #4139: a torn trailing line must not fail the whole window ------
+
+/// A crash (or SIGKILL) mid-append can leave the final line partially written,
+/// possibly cut inside a multi-byte character — an ordinary shape here, since
+/// session logs carry CJK text. `read_log` decoded the whole window with
+/// `String::from_utf8` and so lost every complete line before the tear too.
+#[test]
+fn a_torn_tail_does_not_hide_the_complete_lines() {
+    let tmp = tempdir().unwrap();
+    let svc = SessionLogService::start(
+        tmp.path(),
+        SessionId::from_string("ses_torn").unwrap(),
+        "alice",
+        None,
+        "user-alice",
+        None,
+    )
+    .unwrap();
+
+    svc.append_log(AuditEntry::new("mem_write").path("a.md").bytes(10))
+        .unwrap();
+    svc.append_log(AuditEntry::new("mem_read").path("a.md").bytes(10))
+        .unwrap();
+
+    // Cut the next append short inside the final multi-byte character.
+    let path = svc.log_path().to_path_buf();
+    let mut raw = std::fs::read(&path).unwrap();
+    let torn = r#"{"action":"mem_grep","path":"笔记"}"#.as_bytes();
+    raw.extend_from_slice(&torn[..torn.len() - 4]);
+    assert!(
+        std::str::from_utf8(&raw).is_err(),
+        "the fixture must really end mid-character"
+    );
+    std::fs::write(&path, &raw).unwrap();
+
+    let log = svc
+        .read_log()
+        .expect("a torn tail must not fail the whole window");
+    let lines: Vec<&str> = log.lines().filter(|line| !line.is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "both complete lines must survive the tear: {log:?}"
+    );
+    assert!(
+        !log.contains(char::REPLACEMENT_CHARACTER),
+        "the torn bytes are dropped, not replaced"
+    );
+}
+
+/// The same rule at the other end of the window: a log past the 1 MiB cap is
+/// returned as a tail found by line boundary, and that tail can end torn too.
+#[test]
+fn the_capped_tail_drops_a_torn_last_line_too() {
+    let tmp = tempdir().unwrap();
+    let svc = SessionLogService::start(
+        tmp.path(),
+        SessionId::from_string("ses_torn_cap").unwrap(),
+        "alice",
+        None,
+        "user-alice",
+        None,
+    )
+    .unwrap();
+
+    let line = format!(
+        "{{\"action\":\"mem_write\",\"path\":\"{}\"}}\n",
+        "x".repeat(200)
+    );
+    let mut body = String::new();
+    while body.len() < 1_048_576 + 4096 {
+        body.push_str(&line);
+    }
+    let mut bytes = body.into_bytes();
+    let torn = r#"{"action":"mem_grep","path":"笔记"}"#.as_bytes();
+    bytes.extend_from_slice(&torn[..torn.len() - 4]);
+    std::fs::write(svc.log_path(), &bytes).unwrap();
+
+    let log = svc
+        .read_log()
+        .expect("the capped window must survive a torn tail as well");
+    assert!(log.len() <= 1_048_576, "the cap still bounds the answer");
+    assert!(!log.is_empty(), "complete lines exist inside the cap");
+    assert!(
+        log.lines()
+            .all(|line| line.starts_with('{') && line.ends_with('}')),
+        "every returned line is complete"
+    );
+}

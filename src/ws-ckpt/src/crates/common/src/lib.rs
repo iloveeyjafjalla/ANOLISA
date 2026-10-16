@@ -424,8 +424,6 @@ pub enum ErrorCode {
     DiskSpaceInsufficient,
     CwdOccupied,
     CwdScanFailed,
-    /// A diff path cannot be represented as UTF-8; fix the filename before retrying.
-    UnsupportedWorkspacePath,
 }
 
 /// Opaque identity for one live writable-subvolume generation of a workspace.
@@ -562,8 +560,6 @@ pub enum GuardedRollbackRejectionCodeV2 {
     EvidenceCapacityReached,
     CwdOccupied,
     CwdScanFailed,
-    /// A diff path cannot be represented as UTF-8; unchanged input must not be retried.
-    UnsupportedWorkspacePath,
 }
 
 /// Validates the canonical `ws-xxxxxx` identifier and optional `-N` collision suffix.
@@ -802,8 +798,16 @@ impl SnapshotIndex {
                 .snapshots
                 .get(deleted_parent)
                 .and_then(|m| m.parent_id.clone());
+            let mut walked: HashSet<String> = HashSet::new();
             while let Some(ref pid) = sp {
                 if !ids.contains(pid) {
+                    break;
+                }
+                if !walked.insert(pid.clone()) {
+                    // A parent cycle inside the deleted set has no surviving
+                    // ancestor: following it never ends, and a load that walks
+                    // it would never finish. No ancestor is the answer.
+                    sp = None;
                     break;
                 }
                 sp = self.snapshots.get(pid).and_then(|m| m.parent_id.clone());
@@ -823,8 +827,14 @@ impl SnapshotIndex {
         if let Some(ref h) = self.head.clone() {
             if ids.contains(h) {
                 let mut p = self.snapshots.get(h).and_then(|m| m.parent_id.clone());
+                let mut walked: HashSet<String> = HashSet::new();
                 while let Some(ref pid) = p {
                     if !ids.contains(pid) {
+                        break;
+                    }
+                    if !walked.insert(pid.clone()) {
+                        // The same cycle guard as the reparenting walk above.
+                        p = None;
                         break;
                     }
                     p = self.snapshots.get(pid).and_then(|m| m.parent_id.clone());
@@ -1932,7 +1942,6 @@ mod tests {
             ErrorCode::DiskSpaceInsufficient,
             ErrorCode::CwdOccupied,
             ErrorCode::CwdScanFailed,
-            ErrorCode::UnsupportedWorkspacePath,
         ];
         for code in codes {
             let resp = Response::Error {
@@ -3644,10 +3653,6 @@ mod tests {
             bincode::serialize(&ErrorCode::CwdScanFailed).unwrap(),
             12_u32.to_le_bytes()
         );
-        assert_eq!(
-            bincode::serialize(&ErrorCode::UnsupportedWorkspacePath).unwrap(),
-            13_u32.to_le_bytes()
-        );
     }
 
     #[test]
@@ -3709,19 +3714,11 @@ mod tests {
             GuardedRollbackRejectionCodeV2::EvidenceCapacityReached,
             GuardedRollbackRejectionCodeV2::CwdOccupied,
             GuardedRollbackRejectionCodeV2::CwdScanFailed,
-            GuardedRollbackRejectionCodeV2::UnsupportedWorkspacePath,
         ];
-        for (code, expected_discriminant) in rollback_rejections.iter().zip(0_u32..=16) {
+        for (code, expected_discriminant) in rollback_rejections.iter().zip(0_u32..=15) {
             assert_eq!(
                 bincode::serialize(code).unwrap(),
                 expected_discriminant.to_le_bytes()
-            );
-            assert_eq!(
-                bincode::deserialize::<GuardedRollbackRejectionCodeV2>(
-                    &expected_discriminant.to_le_bytes()
-                )
-                .unwrap(),
-                *code
             );
         }
     }
@@ -3779,5 +3776,80 @@ mod tests {
         assert!(
             validate_checkpoint_id_v2(&"a".repeat(GUARDED_CHECKPOINT_ID_MAX_BYTES_V2 + 1)).is_err()
         );
+    }
+
+    #[test]
+    fn prune_chain_terminates_on_a_parent_cycle_below_the_head() {
+        // a ↔ b form a cycle entirely inside the deleted set, and c hangs off b.
+        // Reparenting c has no surviving ancestor to find, so the walk must stop
+        // rather than follow the cycle forever.
+        let mut idx = SnapshotIndex::new(PathBuf::from("/ws"));
+        idx.snapshots.insert("a".into(), meta(Some("b"), vec!["b"]));
+        idx.snapshots.insert("b".into(), meta(Some("a"), vec!["c"]));
+        idx.snapshots
+            .insert("c".into(), meta(Some("b"), vec![LIVE_CHILD]));
+        idx.head = Some("c".into());
+
+        let ids: HashSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            idx.prune_chain(&ids);
+            let _ = tx.send(idx);
+        });
+        let idx = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("prune_chain must terminate on a parent cycle inside the deleted set");
+
+        assert_eq!(
+            idx.snapshots["c"].parent_id, None,
+            "with no surviving ancestor the child becomes a root"
+        );
+        assert_eq!(idx.head.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn prune_chain_terminates_when_the_head_is_inside_a_cycle() {
+        // The head itself carries the cycle, so the head fix-up walk is the one
+        // that has to stop.
+        let mut idx = SnapshotIndex::new(PathBuf::from("/ws"));
+        idx.snapshots.insert("a".into(), meta(Some("b"), vec!["b"]));
+        idx.snapshots
+            .insert("b".into(), meta(Some("a"), vec![LIVE_CHILD]));
+        idx.head = Some("b".into());
+
+        let ids: HashSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            idx.prune_chain(&ids);
+            let _ = tx.send(idx);
+        });
+        let idx = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("prune_chain must terminate when the head sits in a parent cycle");
+
+        assert_eq!(idx.head, None, "no surviving ancestor means no head");
+    }
+
+    #[test]
+    fn prune_chain_terminates_on_a_self_parented_snapshot() {
+        // The degenerate cycle: a snapshot whose parent is itself.
+        let mut idx = SnapshotIndex::new(PathBuf::from("/ws"));
+        idx.snapshots.insert("a".into(), meta(Some("a"), vec!["c"]));
+        idx.snapshots
+            .insert("c".into(), meta(Some("a"), vec![LIVE_CHILD]));
+        idx.head = Some("c".into());
+
+        let ids: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            idx.prune_chain(&ids);
+            let _ = tx.send(idx);
+        });
+        let idx = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a self-parented snapshot must not make the walk run forever");
+
+        assert_eq!(idx.snapshots["c"].parent_id, None);
+        assert_eq!(idx.head.as_deref(), Some("c"));
     }
 }

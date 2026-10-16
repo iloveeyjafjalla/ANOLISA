@@ -16,6 +16,22 @@ use crate::service::MemoryService;
 const TOOL: &str = "mem_grep";
 const DEFAULT_MAX_HITS: usize = 200;
 const MAX_LINE_LEN: usize = 4096;
+
+/// The first `max` bytes of `line`, cut back to a character boundary.
+///
+/// `str::truncate` asserts the new length is a boundary, so truncating a line
+/// whose byte `max` falls inside a multi-byte character used to panic the whole
+/// tool call — an ordinary shape for CJK prose or base64-with-unicode blobs.
+fn truncate_line(line: &str, max: usize) -> String {
+    if line.len() <= max {
+        return line.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    line[..end].to_string()
+}
 const MAX_DEPTH: usize = 16;
 
 #[derive(Debug, Clone, Default)]
@@ -115,18 +131,18 @@ pub fn grep(svc: &MemoryService, pattern: &str, opts: GrepOptions) -> Result<Vec
         };
         let reader = BufReader::new(f);
         for (idx, line_result) in reader.lines().enumerate() {
-            let mut line = match line_result {
+            let line = match line_result {
                 Ok(l) => l,
                 Err(_) => break,
             };
-            if line.len() > MAX_LINE_LEN {
-                line.truncate(MAX_LINE_LEN);
-            }
+            // The match runs against the whole line: a minified file is one
+            // line, and truncating before matching made every needle past the
+            // cap invisible — a silent "no match" for content the file holds.
             if re.is_match(&line) {
                 hits.push(GrepHit {
                     path: rel_path.clone(),
                     line: idx + 1,
-                    text: line,
+                    text: truncate_line(&line, MAX_LINE_LEN),
                 });
                 if hits.len() >= max {
                     break 'outer;

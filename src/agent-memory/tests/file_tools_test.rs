@@ -446,3 +446,62 @@ mod symlink_attacks {
         assert!(!outside.path().join("escape/inside").exists());
     }
 }
+
+// ---------- #4289: the line cap must not panic or hide matches --------------
+
+/// Byte 4096 landing inside a multi-byte character used to make `truncate`
+/// panic the whole tool call. The assertion looks the hit up by path: the
+/// store's own files can match the same pattern.
+#[test]
+fn grep_multibyte_line_at_cap_does_not_panic() {
+    let (_t, svc) = setup();
+    // 4095 ASCII bytes, then a two-byte character straddling byte 4096.
+    let long = format!("{}é{}", "x".repeat(4095), "y".repeat(64));
+    svc.write("prose.md", &format!("{long}\n"), false).unwrap();
+
+    let hits = svc.grep("x", GrepOptions::default()).unwrap();
+    let hit = hits
+        .iter()
+        .find(|hit| hit.path == "prose.md")
+        .expect("the matching line must be reported, not panic");
+    assert_eq!(hit.line, 1);
+    assert!(
+        hit.text.len() <= 4096,
+        "the reported text is still bounded by the cap, got {}",
+        hit.text.len()
+    );
+    assert!(
+        hit.text.is_char_boundary(hit.text.len()),
+        "the reported text ends on a character boundary"
+    );
+}
+
+/// A needle past byte 4096 was unreachable, because the match ran on the
+/// truncated line: minified one-line files silently reported "no match".
+#[test]
+fn grep_matches_beyond_line_cap() {
+    let (_t, svc) = setup();
+    let long = format!("{}NEEDLE_AT_5000", "x".repeat(4990));
+    svc.write("minified.json", &format!("{long}\n"), false).unwrap();
+
+    let hits = svc.grep("NEEDLE_AT_5000", GrepOptions::default()).unwrap();
+    let hit = hits
+        .iter()
+        .find(|hit| hit.path == "minified.json")
+        .expect("a needle past the cap must still be found");
+    assert_eq!(hit.line, 1);
+}
+
+/// The cap still bounds what a short line reports, unchanged.
+#[test]
+fn grep_reports_short_lines_unchanged() {
+    let (_t, svc) = setup();
+    svc.write("small.md", "alpha needle omega\n", false).unwrap();
+
+    let hits = svc.grep("needle", GrepOptions::default()).unwrap();
+    let hit = hits
+        .iter()
+        .find(|hit| hit.path == "small.md")
+        .expect("the short line matches");
+    assert_eq!(hit.text, "alpha needle omega");
+}

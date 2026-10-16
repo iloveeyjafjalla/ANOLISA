@@ -86,10 +86,17 @@ def find_ws_path(work_dir: str, sheet_name: str | None) -> str:
     for rel in rels_tree.getroot():
         if rel.get("Id") == rid:
             target = rel.get("Target")
-            # Handle absolute paths (starting with /) and relative paths
+            # A Target is either absolute (leading /, relative to the package
+            # root) or relative to the part that declares the relationship —
+            # which is xl/ here, the OPC default and what this repo's own
+            # templates/minimal_xlsx uses. Joining a relative target straight
+            # onto the work dir looked for <work>/worksheets/sheet1.xml and
+            # crashed on every such file.
             if target.startswith("/"):
-                target = target[1:]  # Remove leading /
-            return os.path.join(work_dir, target)
+                return os.path.join(work_dir, target[1:])
+            if target.startswith("xl/"):
+                return os.path.join(work_dir, target)
+            return os.path.join(work_dir, "xl", target)
 
     print(f"ERROR: Relationship not found: {rid}")
     sys.exit(1)

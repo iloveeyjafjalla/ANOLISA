@@ -194,7 +194,19 @@ def process_worksheet(path: str, at: int, delta: int) -> int:
             # Also update formulas in every row (formulas can reference any row)
             for cell_el in row_el:
                 f_el = cell_el.find(_tag("f"))
-                if f_el is not None and f_el.text:
+                if f_el is None:
+                    continue
+                # A shared/array formula's `ref` names the range its group
+                # covers. Shifting the members without shifting it leaves the
+                # relocated consumers outside the declared range — invalid
+                # OOXML, which Excel answers with a repair prompt.
+                ref = f_el.get("ref")
+                if ref:
+                    new_ref = shift_sqref(ref, at, delta)
+                    if new_ref != ref:
+                        f_el.set("ref", new_ref)
+                        changes += 1
+                if f_el.text:
                     new_f = shift_formula(f_el.text, at, delta)
                     if new_f != f_el.text:
                         f_el.text = new_f

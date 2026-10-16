@@ -178,10 +178,36 @@ def check(xlsx_path: str, sheet_filter: str | None = None) -> dict:
         return results
 
     with z:
-        sheet_names = get_sheet_names(z)
-        sheet_files = get_sheet_files(z)
+        try:
+            sheet_names = get_sheet_names(z)
+            sheet_files = get_sheet_files(z)
+        except (KeyError, ET.ParseError, zipfile.BadZipFile) as error:
+            # A zip that is not an OOXML workbook used to reach the parser and
+            # die with a traceback; a checker owes the caller a verdict, not a
+            # stack trace.
+            results["errors"].append({
+                "type": "file_error",
+                "message": f"not an OOXML workbook ({error})",
+            })
+            results["error_count"] = 1
+            return results
         valid_sheet_names = set(sheet_names.values())
         defined_names = get_defined_names(z)
+
+        if sheet_filter and sheet_filter not in valid_sheet_names:
+            # Nothing was checked, so nothing may be reported as passing: the
+            # filter named a sheet this workbook does not have, and "PASS — No
+            # formula errors detected" over zero sheets is exactly the answer a
+            # typo must not produce.
+            results["errors"].append({
+                "type": "file_error",
+                "message": (
+                    f"no sheet named '{sheet_filter}' in this workbook "
+                    f"(sheets: {', '.join(sorted(valid_sheet_names)) or 'none'})"
+                ),
+            })
+            results["error_count"] = 1
+            return results
 
         for rid, sheet_name in sheet_names.items():
             # Apply sheet filter if requested

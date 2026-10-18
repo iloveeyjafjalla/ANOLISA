@@ -688,8 +688,12 @@ Examples:
     )
     summary_text = (
         table_txt
-        + f"\n\nSummary: {total_tasks} tasks, {passed_tasks} passed ({passed_tasks/total_tasks*100:.1f}%)\n"
-        + f"Trials: {total_trials} total, {passed_trials} passed ({passed_trials/total_trials*100:.1f}%)\n"
+        # An empty batch_results.json (a run that errored before its first
+        # trial, or a trace directory filtered to nothing) reaches this
+        # line after the reports are paid for: it must render a summary
+        # instead of dividing by zero and losing every output file.
+        + f"\n\nSummary: {total_tasks} tasks, {passed_tasks} passed ({passed_tasks/(total_tasks or 1)*100:.1f}%)\n"
+        + f"Trials: {total_trials} total, {passed_trials} passed ({passed_trials/(total_trials or 1)*100:.1f}%)\n"
     )
     summary_csv = render_csv(rows)
 

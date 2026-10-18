@@ -321,8 +321,11 @@ def main():
             sum(1 for tr in t.get("trials", []) if tr.get("passed"))
             for t in data
         )
-        output += f"\n\nSummary: {total_tasks} tasks, {passed_tasks} passed ({passed_tasks/total_tasks*100:.1f}%)\n"
-        output += f"Trials: {total_trials} total, {passed_trials} passed ({passed_trials/total_trials*100:.1f}%)\n"
+        # An empty batch_results.json (a filter or range that matched nothing —
+        # or a run that errored before its first trial) must still render a
+        # summary: dividing by the count crashed after the table was built.
+        output += f"\n\nSummary: {total_tasks} tasks, {passed_tasks} passed ({passed_tasks/(total_tasks or 1)*100:.1f}%)\n"
+        output += f"Trials: {total_trials} total, {passed_trials} passed ({passed_trials/(total_trials or 1)*100:.1f}%)\n"
 
     if args.output:
         with open(args.output, "w") as f:
